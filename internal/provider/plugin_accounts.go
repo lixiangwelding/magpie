@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/yetone/magpie/internal/plugin"
@@ -224,9 +225,41 @@ func pluginLogins(pp plugin.Provider) []pluginLogin {
 		mark = ownMark(pp.ID)
 	}
 	labels := pluginLabels(pp, named)
-	loginsMu.Lock()
+	// read without the lock, which is taken only for a change to write:
+	// a list that changes nothing, nearly every one, locked logins.json.lock
+	// all the same. Every model look-up asks a plugin for its accounts, so
+	// with a provider of many accounts (a plugin of 44, one per sign-in)
+	// each request took that lock dozens of times, and concurrent requests
+	// queued behind each other until the gateway gave up on them unrouted
+	// (the 30s "held this request" cut). logins.json is only ever replaced
+	// whole (writePrivate), so the read is one write's file (sideLogins
+	// reads it the same way, #1665).
 	ls := readLogins()
-	changed := false
+	if pluginLoginsWouldChange(ls, agent, pp.Accounts, byKey, own, mark, labels) {
+		loginsMu.Lock()
+		// read afresh under the lock: another magpie may have written it
+		// since the look above, and this change is made from what it says
+		ls, changed := keepPluginLogins(readLogins(), agent, pp.Accounts, byKey, own, mark, labels)
+		if changed {
+			_ = writeLogins(ls)
+		}
+		loginsMu.Unlock()
+	}
+	var out []pluginLogin
+	for _, l := range sideLogins(agent, "", func(l savedLogin) bool { _, ok := byKey[l.Home]; return ok && l.Hidden == "" }) {
+		l.Lapsed = l.saved.Lapsed // a refused sign-in shows on the account
+		l.Own = own[l.saved.Home]
+		out = append(out, pluginLogin{l, byKey[l.saved.Home]})
+	}
+	return out
+}
+
+// keepPluginLogins brings ls up to what the provider's accounts are, writing
+// it when that changed it: the agent's accounts not signed in to any more go,
+// the ones not listed yet are added, one renamed is renamed. Looking (look),
+// it changes and writes nothing, and says whether it would. Written, it is
+// called under loginsMu; looking, it is not, as keepSideLogins is.
+func keepPluginLogins(ls []savedLogin, agent string, accounts []plugin.Account, byKey map[string]plugin.Account, own map[string]bool, mark string, labels map[string]string) (out []savedLogin, changed bool) {
 	have := map[string]bool{}
 	keep := ls[:0]
 	for _, l := range ls {
@@ -249,23 +282,21 @@ func pluginLogins(pp plugin.Provider) []pluginLogin {
 		keep = append(keep, l)
 	}
 	ls = keep
-	for _, a := range pp.Accounts {
+	for _, a := range accounts {
 		if !have[a.Key] {
 			ls = append(ls, savedLogin{Agent: agent, User: labels[a.Key], Home: a.Key, On: true, Seen: time.Now().UTC().Truncate(time.Second)})
 			changed = true
 		}
 	}
-	if changed {
-		_ = writeLogins(ls)
-	}
-	loginsMu.Unlock()
-	var out []pluginLogin
-	for _, l := range sideLogins(agent, "", func(l savedLogin) bool { _, ok := byKey[l.Home]; return ok && l.Hidden == "" }) {
-		l.Lapsed = l.saved.Lapsed // a refused sign-in shows on the account
-		l.Own = own[l.saved.Home]
-		out = append(out, pluginLogin{l, byKey[l.saved.Home]})
-	}
-	return out
+	return ls, changed
+}
+
+// pluginLoginsWouldChange says whether keepPluginLogins would change ls,
+// without changing or writing anything: the look the read takes before it
+// takes the lock.
+func pluginLoginsWouldChange(ls []savedLogin, agent string, accounts []plugin.Account, byKey map[string]plugin.Account, own map[string]bool, mark string, labels map[string]string) bool {
+	_, changed := keepPluginLogins(slices.Clone(ls), agent, accounts, byKey, own, mark, labels)
+	return changed
 }
 
 func pluginSide(pp plugin.Provider) []sideLogin {
@@ -381,16 +412,34 @@ func keepPluginPlan(pp plugin.Provider, key, plan string) {
 	if plan == "" {
 		return
 	}
+	// read without the lock, which is taken only for a change to write: a
+	// usage reading keeps the plan it told on every account's row, and
+	// nearly every reading tells the plan the row has, so taking the lock
+	// for it once an account made 44 lock waits a refresh with a plugin of
+	// 44 accounts, each queuing behind a request's own (the 30s "held this
+	// request" cut). keepSideLogins looks the same way (#1665).
+	agent := pluginAgent(pp)
+	planOf := func(ls []savedLogin) (string, bool) {
+		for _, l := range ls {
+			if l.Agent == agent && l.Home == key {
+				return l.Plan, true
+			}
+		}
+		return "", false
+	}
+	if cur, ok := planOf(readLogins()); !ok || cur == plan {
+		return
+	}
 	loginsMu.Lock()
 	defer loginsMu.Unlock()
 	ls := readLogins()
-	for i, l := range ls {
-		if l.Agent == pluginAgent(pp) && l.Home == key {
-			if l.Plan != plan {
+	if cur, ok := planOf(ls); ok && cur != plan {
+		for i, l := range ls {
+			if l.Agent == agent && l.Home == key {
 				ls[i].Plan = plan
 				_ = writeLogins(ls)
+				return
 			}
-			return
 		}
 	}
 }
@@ -409,7 +458,9 @@ func notePluginLapse(pp plugin.Provider, key string, status int) {
 // 15.6ms, and a reading begun just after an answer would read as begun
 // with it.
 var (
-	pluginSignInTold uint64
+	// pluginSignInTold is atomic: written under loginsMu, read without it
+	// by pluginSignInAt (see there).
+	pluginSignInTold atomic.Uint64
 	pluginSignInSaid = map[string]uint64{}
 )
 
@@ -418,9 +469,12 @@ const toldNow = ^uint64(0)
 
 // pluginSignInAt is the count a usage reading beginning now goes by.
 func pluginSignInAt() uint64 {
-	loginsMu.Lock()
-	defer loginsMu.Unlock()
-	return pluginSignInTold
+	// an atomic read, without loginsMu: taking the lock to read a count once
+	// an account made a usage refresh wait for every request's own hold on
+	// it (the 30s "held this request" cut). pluginSignInTold is written
+	// atomically under the lock (notePluginLapseOf), so both sides are
+	// race-free without the reader holding it.
+	return pluginSignInTold.Load()
 }
 
 // notePluginLapseSince is notePluginLapse for what a usage reading begun
@@ -446,8 +500,7 @@ func notePluginLapseOf(agent, key string, status int, began uint64, text func(us
 		return
 	}
 	if began == toldNow {
-		pluginSignInTold++
-		began = pluginSignInTold
+		began = pluginSignInTold.Add(1)
 	}
 	pluginSignInSaid[said] = began
 	ls := readLogins()
