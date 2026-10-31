@@ -106,12 +106,18 @@ A 档（本次已跑）：`node --test internal/gui/tests/leadsub.test.cjs`（Pl
 正是 Chromium 内核的 WebView2）；WebKit 一条腿因本机缺宿主库（libgtk-4、
 libgstreamer 等）且无免密 sudo，未跑。
 
-`go test -tags nogui ./...` 全仓：`internal/gui` 余 `TestLaneLimitRoutes`
-（车道计数）与 `TestSettingsSaveKeepsWhatItDoesNotSend`（Settings 页的 SearchAll
-字段）两条失败，两条在引入本 fork 的 `leadsub` 之前就已存在（已用
-`git checkout 66143cb` 复核），与本次改动无关。
+`go test -tags nogui ./...` 全仓的最终结果：`internal/gui` 余
+`TestLaneLimitRoutes`（车道计数）与 `TestSettingsSaveKeepsWhatItDoesNotSend`
+（Settings 页的 SearchAll 字段）两条失败，两条在引入本 fork 的 `leadsub`
+之前就已存在（已用 `git checkout 66143cb` 复核），与本次改动无关。
+`internal/agent` 余 `TestGrokInstalled` 一条失败：本 fork 从未改过这个包，
+失败是本机环境所致——测试的假 `grok` 是指向非可执行文件的符号链接。
+`internal/cli` 与 `internal/gateway` 单独跑通过（`go test -tags nogui
+-timeout 20m`）：全仓一起跑时这两个包在 10 分钟上限处超时，是机器被并发
+占满，不是测试本身。
 `TestBuiltinsTranslated`、`TestBuiltinClientsLoaded`、`TestBootSaysBuiltinsOff`、
-`TestBuiltinSwitch`、`TestBuiltinConfig` 通过。
+`TestBuiltinSwitch`、`TestBuiltinConfig`、`TestPluginPageServicePlatforms`、
+`TestPluginPageServiceProxyGuards` 通过。
 `node --test internal/gui/tests/i18n-keys.test.cjs` 只剩上游既有的
 `plugins/routing/i18n.js "Unmarked"` 一条失败（`git stash` 验证与本次无关）。
 交叉构建 Windows 产物已通过（`CGO_ENABLED=0 GOOS=windows GOARCH=amd64
