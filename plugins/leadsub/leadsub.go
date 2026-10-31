@@ -44,9 +44,9 @@ import (
 	"github.com/yetone/magpie/internal/provider"
 )
 
-// Settings are the plugin's settings, at their defaults. The window draws
-// their form from the schema made of them (Plugins › Built-in), so a form
-// here is a form there, with no page of our own to write.
+// Settings persist the split. The dedicated page writes the agent fields
+// immediately and reads them back; Plugins › Built-in also exposes this
+// schema for users who configure the split without opening its page.
 type Settings struct {
 	// Agent is the agent whose two models are set: claude-desktop (its
 	// Code tab and Cowork) or claude (Claude Code).
@@ -96,6 +96,10 @@ func init() {
 		ID: "leadsub", API: "^1", Requires: []string{"window", "providers"},
 		Name: "Lead and subagents", Sub: "Run the main thread on one model and its subagents on another",
 		One: "1 agent split in two", Many: "{n} agents split in two",
+		// The page of its own, in the sidebar under Work: the split as it
+		// is now, and the two routing groups picked and made here.
+		Parts:  []pluginrt.Part{{Slot: "nav.page", Key: "leadsub"}},
+		Client: []string{"i18n.js", "client.js", "leadsub.css"},
 		InUse: func() (int, error) {
 			// on while the agent it splits has a subagent model: off, the
 			// split would go on working with nowhere to see it
