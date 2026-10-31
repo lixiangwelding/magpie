@@ -24,10 +24,12 @@ import (
 //
 // So a page served to a browser is told (/api/plugin-pages' service, the
 // bridge's magpie.service) where the same service is on this server's own
-// address: pageServicePath under the page's token. The service stays on
-// 127.0.0.1, and reaching it takes what reaching the page's files takes:
-// the token, which only a signed-in /api hands out (webGuard), and the
-// allow list before it (gateway.AllowGuard).
+// address: pageServicePath under the page's token. Windows' desktop window
+// is told the same (pluginpage.go's pageServiceProxy), so its sandboxed
+// WebView2 frame stays on the asset origin it was already loaded from.
+// The service stays on 127.0.0.1, and reaching it takes what reaching the
+// page's files takes: the token, the sandbox's Origin (null), and on web
+// the allow list before it (gateway.AllowGuard).
 
 // pageServicePath is where a page's service is, under the page's token:
 // pluginPagePrefix + token + "/" + pageServicePath + the service's path.

@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -124,28 +125,118 @@ func listed(t *testing.T, h http.Handler) pluginPage {
 	return pages[0]
 }
 
-// aigcfree on Discord: `magpie web` on a server, opened from a Windows
-// PC's browser, sent the chat page's frame to 127.0.0.1, the PC itself. A
-// page served to a browser is told where its service is on magpie web's
-// own address, and the desktop window is told nothing and keeps going
-// to 127.0.0.1 itself.
-func TestPluginPageServiceListedToBrowserOnly(t *testing.T) {
+// A browser and Windows' WebView2 use the service proxy; other desktop
+// engines keep navigating directly to loopback. Listing and serving agree.
+func TestPluginPageServicePlatforms(t *testing.T) {
+	for _, goos := range []string{"windows", "darwin", "linux"} {
+		for _, web := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/web=%t", goos, web), func(t *testing.T) {
+				f := newFakeService(t)
+				servicePlugins(t, `{"port": `+strconv.Itoa(f.port)+`, "option": "port"}`, nil)
+				mux := http.NewServeMux()
+				pluginPageRoutesWithService(mux, pageServiceProxy(web, goos))
+				p := listed(t, mux)
+				wantService, wantCode := "", http.StatusNotFound
+				if web || goos == "windows" {
+					wantService, wantCode = pageServicePath, http.StatusOK
+				}
+				if p.Service != wantService {
+					t.Errorf("service %q, want %q", p.Service, wantService)
+				}
+				svc := strings.TrimSuffix(p.URL, "index.html") + pageServicePath
+				if w := do(mux, httptest.NewRequest("GET", svc, nil)); w.Code != wantCode {
+					t.Errorf("service route: %d, want %d", w.Code, wantCode)
+				}
+				if _, _, path := f.last(); wantCode == http.StatusNotFound && path != "" {
+					t.Errorf("disabled proxy reached service: %q", path)
+				}
+			})
+		}
+	}
+	// The production entry selects the running platform without a caller
+	// having to opt Windows into the proxy.
 	f := newFakeService(t)
-	servicePlugins(t, `{"port": `+strconv.Itoa(f.port)+`, "option": "port"}`, nil)
-	p := listed(t, serviceMux(true))
-	if p.Service != pageServicePath {
-		t.Errorf("a browser's page: service %q, want %q (relative to the page's own address)", p.Service, pageServicePath)
+	servicePlugins(t, `{"port": `+strconv.Itoa(f.port)+`}`, nil)
+	want := ""
+	if runtime.GOOS == "windows" {
+		want = pageServicePath
 	}
-	if d := listed(t, serviceMux(false)); d.Service != "" {
-		t.Errorf("the desktop window's page: service %q, want none", d.Service)
+	if p := listed(t, serviceMux(false)); p.Service != want {
+		t.Errorf("native routes on %s: service %q, want %q", runtime.GOOS, p.Service, want)
 	}
-	// the desktop window serves no service path at all
-	svc := strings.TrimSuffix(p.URL, "index.html") + pageServicePath
-	if w := do(serviceMux(false), httptest.NewRequest("GET", svc, nil)); w.Code != 404 {
-		t.Errorf("the service through the desktop window's routes: %d, want 404", w.Code)
-	}
-	if _, _, path := f.last(); path != "" {
-		t.Errorf("the service was reached from the desktop window's routes: %q", path)
+}
+
+func TestPluginPageServiceProxyGuards(t *testing.T) {
+	for _, mode := range []struct {
+		name string
+		web  bool
+	}{
+		{"web", true},
+		{"windows desktop", false},
+	} {
+		t.Run(mode.name, func(t *testing.T) {
+			f := newFakeService(t)
+			servicePlugins(t, `{"port": `+strconv.Itoa(f.port)+`}`, nil)
+			mux := http.NewServeMux()
+			pluginPageRoutesWithService(mux, pageServiceProxy(mode.web, "windows"))
+			mux.HandleFunc("GET /api/state", func(w http.ResponseWriter, r *http.Request) {
+				fmt.Fprint(w, "private")
+			})
+			h := noFramedAPI(mux)
+			p := listed(t, h)
+			base := strings.TrimSuffix(p.URL, "index.html") + pageServicePath
+			for _, c := range []struct {
+				name, path string
+				origins    []string
+				code       int
+			}{
+				{"navigation", base, nil, 200},
+				{"sandbox", base + "api/x", []string{"null"}, 200},
+				{"foreign origin", base, []string{"https://evil.example"}, 403},
+				{"native origin", base, []string{"http://wails.localhost"}, 403},
+				{"multiple origins", base, []string{"null", "https://evil.example"}, 403},
+				{"bad token", pluginPagePrefix + strings.Repeat("a", 32) + "/" + pageServicePath, nil, 404},
+				{"framed API", "/api/state", []string{"null"}, 403},
+			} {
+				t.Run(c.name, func(t *testing.T) {
+					req := httptest.NewRequest("GET", c.path+"?probe="+strings.ReplaceAll(c.name, " ", "-"), nil)
+					req.Header.Set("Cookie", "magpie=session")
+					for _, origin := range c.origins {
+						req.Header.Add("Origin", origin)
+					}
+					_, _, before := f.last()
+					w := do(h, req)
+					if w.Code != c.code {
+						t.Fatalf("HTTP %d, want %d", w.Code, c.code)
+					}
+					seen, host, path := f.last()
+					if c.code != http.StatusOK {
+						if path != before {
+							t.Errorf("rejected request reached service: %q", path)
+						}
+						return
+					}
+					if host != "127.0.0.1:"+strconv.Itoa(f.port) || seen.Get("Cookie") != "" || w.Header().Get("Set-Cookie") != "" {
+						t.Error("proxy did not preserve Host/cookie isolation")
+					}
+					if w.Header().Get("Content-Security-Policy") != pageServicePolicy || w.Header().Get("Referrer-Policy") != "no-referrer" {
+						t.Error("proxy did not preserve sandbox/referrer policy")
+					}
+					if seen.Get("Origin") != req.Header.Get("Origin") {
+						t.Error("proxy changed the sandbox Origin")
+					}
+				})
+			}
+			// Changing the declared service to the gateway's port must never
+			// expose its unauthenticated loopback endpoints through the proxy.
+			t.Setenv("MAGPIE_ADDR", "127.0.0.1:"+strconv.Itoa(f.port))
+			if p := listed(t, h); p.Service != "" {
+				t.Error("gateway port advertised as a service")
+			}
+			if w := do(h, httptest.NewRequest("GET", base, nil)); w.Code != http.StatusNotFound {
+				t.Errorf("gateway port served: HTTP %d", w.Code)
+			}
+		})
 	}
 }
 

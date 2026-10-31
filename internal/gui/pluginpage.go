@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -84,7 +85,7 @@ type pluginPage struct {
 	Actions []pluginAction `json:"actions,omitempty"`
 	// Service is where a browser reaches the page's local service
 	// (plugin.ServiceSpec) through this server, relative to the page's own
-	// address: only on a page served to a browser (servePageService)
+	// address: in a browser or Windows desktop window (servePageService)
 	Service string `json:"service,omitempty"`
 	// KeepAlive keeps its frame while the reader is on another page
 	// (plugin.PageSpec); else the window lets it go after a while hidden
@@ -293,9 +294,9 @@ func pageHost(ctx context.Context) {
 	}
 }
 
-// servePluginPage serves a file of a plugin's page, by its token, and on
-// a page served to a browser (web) the page's local service too.
-func servePluginPage(rw http.ResponseWriter, r *http.Request, web bool) {
+// servePluginPage serves a file of a plugin's page, by its token, and its
+// local service when proxyService is enabled for this window.
+func servePluginPage(rw http.ResponseWriter, r *http.Request, proxyService bool) {
 	rest := strings.TrimPrefix(r.URL.Path, pluginPagePrefix)
 	tok, rel, ok := strings.Cut(rest, "/")
 	if !ok || len(tok) != 32 {
@@ -314,7 +315,7 @@ func servePluginPage(rw http.ResponseWriter, r *http.Request, web bool) {
 	}
 	// the service's paths are never a file of the page's
 	if strings.HasPrefix(rel, pageServicePath) {
-		if !web || page == nil || page.servicePort() == 0 {
+		if !proxyService || page == nil || page.servicePort() == 0 {
 			http.NotFound(rw, r)
 			return
 		}
@@ -392,19 +393,30 @@ func apiFramed(r *http.Request) bool {
 	return r.Header.Get("Sec-Fetch-Site") == "cross-site" && r.Header.Get("Sec-Fetch-Dest") != "document"
 }
 
+// pageServiceProxy keeps Windows' sandboxed WebView2 frame on the native
+// asset origin, as web keeps a remote browser on the server's origin.
+// Other desktop engines keep their existing direct loopback navigation.
+func pageServiceProxy(web bool, goos string) bool {
+	return web || goos == "windows"
+}
+
 // pluginPageRoutes are the routes of the plugins' pages and panels. web is
-// whether the window is a browser's (isWeb): only there is a page's local
-// service served through this server (servePageService), since only there
-// can 127.0.0.1 be another computer than this one.
+// whether the window is a browser's (isWeb).
 func pluginPageRoutes(mux *http.ServeMux, web bool) {
-	mux.HandleFunc(pluginPagePrefix, func(rw http.ResponseWriter, r *http.Request) { servePluginPage(rw, r, web) })
+	pluginPageRoutesWithService(mux, pageServiceProxy(web, runtime.GOOS))
+}
+
+// pluginPageRoutesWithService uses the same policy for advertising and
+// serving the local service; tests exercise each platform's policy here.
+func pluginPageRoutesWithService(mux *http.ServeMux, proxyService bool) {
+	mux.HandleFunc(pluginPagePrefix, func(rw http.ResponseWriter, r *http.Request) { servePluginPage(rw, r, proxyService) })
 	mux.HandleFunc("GET /api/plugin-pages", func(rw http.ResponseWriter, r *http.Request) {
 		out := pluginPages()
 		if out == nil {
 			out = []pluginPage{}
 		}
 		for i := range out {
-			if web && out[i].servicePort() > 0 {
+			if proxyService && out[i].servicePort() > 0 {
 				out[i].Service = strings.Repeat("../", strings.Count(out[i].file, "/")) + pageServicePath
 			}
 		}
