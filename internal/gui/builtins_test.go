@@ -54,14 +54,22 @@ func TestBuiltinSwitch(t *testing.T) {
 		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
 			t.Fatal(err)
 		}
-		if len(out) != 14 {
+		// the built-ins are the registry's, so a plugin added to this fork
+		// is one of them
+		if len(out) != len(pluginrt.Registered()) {
 			t.Fatalf("the built-ins: %+v", out)
 		}
 		for _, b := range out {
 			// the Gateway, Routing and Usage pages, the routing strategies,
 			// the gateway middleware, privacy masking, web search, key
 			// limits and plugin tools are essential: on in every preset
-			if b.On != (b.ID == "budget" || b.ID == "library" || b.ID == "gateway" || b.ID == "middleware" || b.ID == "redact" || b.ID == "rotation" || b.ID == "routing" || b.ID == "search" || b.ID == "tools" || b.ID == "usage") || b.On != (b.State == pluginrt.Active) {
+			essential := false
+			for _, m := range pluginrt.Registered() {
+				if m.Essential && m.ID == b.ID {
+					essential = true
+				}
+			}
+			if b.On != (essential || b.ID == "library") || b.On != (b.State == pluginrt.Active) {
 				t.Fatalf("after library on: %+v", out)
 			}
 		}
@@ -133,8 +141,21 @@ func TestBootSaysBuiltinsOff(t *testing.T) {
 	if err := pluginrt.Set("library", true); err != nil {
 		t.Fatal(err)
 	}
-	if b := boot(); !strings.Contains(b, `"featuresOff":["groups","otel","sessions","warmups"]`) {
-		t.Fatalf("Essentials picked: %s", b)
+	// Essentials leaves every plugin that is not Essential off, so the
+	// list is read from the registry rather than written here: a plugin
+	// added to this fork is off in it too. Library was turned on above,
+	// so it is the one not off.
+	b := boot()
+	for _, m := range pluginrt.Registered() {
+		if m.Essential || m.ID == "library" {
+			continue
+		}
+		if !strings.Contains(b, `"`+m.ID+`"`) {
+			t.Fatalf("Essentials left %s off: %s", m.ID, b)
+		}
+	}
+	if strings.Contains(b, `"library"`) {
+		t.Fatalf("Essentials left library on: %s", b)
 	}
 }
 
@@ -225,7 +246,12 @@ func TestBuiltinConfig(t *testing.T) {
 	}
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/boot.js", nil))
-	if !strings.Contains(rec.Body.String(), `"pluginConfig":{"gateway":{"callsPage":50}}`) {
+	// every plugin with a config is in boot.js's pluginConfig, so the page
+	// is handed the settings of all of them, not only of one
+	if !strings.Contains(rec.Body.String(), `"gateway":{"callsPage":50}`) {
+		t.Fatalf("boot.js: %s", rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), `"leadsub":{"agent":"claude-desktop"`) {
 		t.Fatalf("boot.js: %s", rec.Body)
 	}
 }
